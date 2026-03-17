@@ -101,14 +101,6 @@ class Scheduler:
         """Check if there are any requests to process."""
         return len(self.waiting) > 0 or len(self.running) > 0
 
-    def resume_request(self, request_id: str) -> None:
-        """Resume a WAITING_FEEDBACK request back to RUNNING."""
-        request = self.requests.get(request_id)
-        if request is None:
-            return
-        if request.status == SchedulerStatus.WAITING_FEEDBACK:
-            request.status = SchedulerStatus.RUNNING
-
     async def get_result(self, request_id: str) -> SchedulerRequest:
         """Wait for a request to complete."""
         if request_id not in self.requests:
@@ -167,11 +159,7 @@ class Scheduler:
         self._step_id += 1
 
         waiting_reqs = [self.requests[req_id] for req_id in self.waiting]
-        running_reqs = [
-            self.requests[req_id]
-            for req_id in self.running
-            if self.requests[req_id].status != SchedulerStatus.WAITING_FEEDBACK
-        ]
+        running_reqs = [self.requests[req_id] for req_id in self.running]
 
         selected = self.batch_planner.select_requests(
             waiting_reqs,
@@ -258,15 +246,12 @@ class Scheduler:
         error: Exception | None = None,
     ) -> None:
         """Clean up finished request."""
-        had_resources = request.status in (
-            SchedulerStatus.RUNNING,
-            SchedulerStatus.WAITING_FEEDBACK,
-        )
+        was_running = request.status == SchedulerStatus.RUNNING
         request.status = status
         request.error = error
         request.finish_time = time.time()
 
-        if had_resources:
+        if was_running:
             self.resource_manager.free(request)
 
         # Remove from queues

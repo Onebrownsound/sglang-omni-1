@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Deque, Optional
@@ -13,11 +12,9 @@ from typing import TYPE_CHECKING, Any, Deque, Optional
 from ..base import Engine
 from .model_runner import ModelRunner
 from .scheduler import Scheduler
-from .types import ModelRunnerOutput, SchedulerOutput, SchedulerStatus
+from .types import ModelRunnerOutput, SchedulerOutput
 
 if TYPE_CHECKING:
-    from sglang_omni.pipeline.stage.stream_queue import StreamQueue
-
     from .runtime.interfaces import CacheManager
 
 logger = logging.getLogger(__name__)
@@ -72,13 +69,11 @@ class OmniEngine(Engine):
         model_runner: ModelRunner,
         cache_manager: CacheManager | None = None,
         enable_overlap: bool = False,
-        feedback_mailbox: StreamQueue | None = None,
     ):
         self.scheduler = scheduler
         self.model_runner = model_runner
         self.cache_manager = cache_manager
         self.enable_overlap = enable_overlap
-        self._feedback_mailbox = feedback_mailbox
 
         self._running = False
         self._loop_task: asyncio.Task[None] | None = None
@@ -132,6 +127,7 @@ class OmniEngine(Engine):
             except asyncio.CancelledError:
                 pass
             self._loop_task = None
+        logger.info("OmniEngine stopped")
 
         # Drain any pending results
         self._drain_pending_results()
@@ -159,48 +155,25 @@ class OmniEngine(Engine):
         scheduler_output = self.scheduler.schedule()
 
         if scheduler_output is None:
-            # Check for arrived feedback even when idle
-            if self._feedback_mailbox is not None:
-                self._check_feedback()
-            await asyncio.sleep(0.001)  # Brief sleep when idle
+            await asyncio.sleep(0.001)
             return False
 
         try:
-            # 2. Check cache (if enabled)
+            # Check cache
             if self.cache_manager is not None:
                 scheduler_output = await self._filter_cached(scheduler_output)
                 if scheduler_output is None:
-                    return True  # All cached, no execution needed
+                    return True
 
-            # 3. Execute
-            # Run CPU model runners inline to avoid threadpool hangs with
-            # non-thread-safe mock/model outputs. Keep threaded execution for
-            # accelerator-backed runners by default.
-            execute_in_thread = getattr(self.model_runner, "execute_in_thread", None)
-            if execute_in_thread is None:
-                device = getattr(self.model_runner, "device", None)
-                device_type = getattr(
-                    device, "type", str(device) if device is not None else ""
-                )
-                execute_in_thread = str(device_type) != "cpu"
+            # Execute
+            model_output = await self._execute_async(scheduler_output)
 
-            if execute_in_thread:
-                loop = asyncio.get_running_loop()
-                model_output = await loop.run_in_executor(
-                    None,
-                    self.model_runner.execute,
-                    scheduler_output,
-                )
-            else:
-                model_output = self.model_runner.execute(scheduler_output)
-
-            # 4. Update cache (if enabled)
+            # Update cache
             if self.cache_manager is not None:
-                await self._update_cache(scheduler_output, model_output)
+                self._update_cache_sync(scheduler_output, model_output)
 
-            # 5. Update state
+            # Update state
             finished = self.scheduler.update(scheduler_output, model_output)
-
             if finished:
                 for req in finished:
                     logger.debug("Request %s finished", req.request_id)
@@ -210,30 +183,8 @@ class OmniEngine(Engine):
                 "OmniEngine step failed, failing %d request(s)",
                 len(scheduler_output.requests),
             )
-            for request in scheduler_output.requests:
-                try:
-                    self.scheduler.fail_request(request.request_id, e)
-                except Exception:
-                    pass
+            self._fail_requests(scheduler_output, e)
             return False
-
-        # 6. Check feedback needs — set WAITING_FEEDBACK for requests needing it
-        iter_ctrl = self.scheduler.iteration_controller
-        if hasattr(iter_ctrl, "needs_feedback"):
-            for request in scheduler_output.requests:
-                if request.status in (
-                    SchedulerStatus.FINISHED,
-                    SchedulerStatus.ABORTED,
-                ):
-                    continue
-                output = model_output.outputs.get(request.request_id)
-                if output is not None and iter_ctrl.needs_feedback(request, output):
-                    request.status = SchedulerStatus.WAITING_FEEDBACK
-                    request._feedback_wait_start = time.time()
-
-        # 7. Check for arrived feedback — resume WAITING_FEEDBACK requests
-        if self._feedback_mailbox is not None:
-            self._check_feedback()
 
         return True
 
@@ -499,73 +450,6 @@ class OmniEngine(Engine):
             batch_data=batch_data,
             step_id=scheduler_output.step_id,
         )
-
-    def _check_feedback(self) -> None:
-        """Check feedback mailbox for arrived feedback and resume requests."""
-        assert self._feedback_mailbox is not None
-        from sglang_omni.pipeline.stage.stream_queue import StreamSignal
-
-        for req_id, request in list(self.scheduler.requests.items()):
-            if request.status != SchedulerStatus.WAITING_FEEDBACK:
-                continue
-            if not self._feedback_mailbox.has(req_id):
-                continue
-            # Try non-blocking get from the queue
-            queue = self._feedback_mailbox._queues.get(req_id)
-            if queue is not None and not queue.empty():
-                try:
-                    item = queue.get_nowait()
-                    if isinstance(item, BaseException):
-                        logger.error(
-                            "Feedback exception for request %s: %s", req_id, item
-                        )
-                        self.scheduler.fail_request(
-                            req_id,
-                            (
-                                item
-                                if isinstance(item, Exception)
-                                else RuntimeError(str(item))
-                            ),
-                        )
-                        continue
-                    if isinstance(item, StreamSignal):
-                        if item.error is not None:
-                            logger.error(
-                                "Feedback error for request %s: %s", req_id, item.error
-                            )
-                            err = (
-                                item.error
-                                if isinstance(item.error, Exception)
-                                else RuntimeError(str(item.error))
-                            )
-                            self.scheduler.fail_request(req_id, err)
-                            continue
-                        if item.is_done:
-                            logger.debug("Feedback done for request %s", req_id)
-                            self.scheduler.resume_request(req_id)
-                            continue
-                    if not hasattr(item, "data"):
-                        continue
-                    # Apply feedback
-                    iter_ctrl = self.scheduler.iteration_controller
-                    if hasattr(iter_ctrl, "apply_feedback"):
-                        iter_ctrl.apply_feedback(request, item.data)
-                    self.scheduler.resume_request(req_id)
-                except Exception as e:
-                    logger.error(
-                        "Feedback handling failed for %s, aborting: %s", req_id, e
-                    )
-                    try:
-                        self.scheduler.fail_request(
-                            req_id,
-                            e if isinstance(e, Exception) else RuntimeError(str(e)),
-                        )
-                    except Exception:
-                        pass
-
-    async def _update_cache(self, scheduler_output: SchedulerOutput, model_output: Any):
-        """Update cache with fresh model outputs."""
-        assert self.cache_manager is not None
 
 
 def _is_prefill_batch(batch_data: Any) -> bool:

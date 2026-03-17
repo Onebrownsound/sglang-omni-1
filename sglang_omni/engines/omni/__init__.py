@@ -2,12 +2,7 @@
 """OmniEngine - unified engine for all model types."""
 
 from .engine import OmniEngine
-from .factory import (
-    create_ar_engine,
-    create_encoder_engine,
-    create_sglang_ar_engine,
-    create_single_pass_engine,
-)
+from .factory import create_ar_engine, create_encoder_engine, create_sglang_ar_engine
 from .model_runner import ModelRunner
 from .runtime.ar import ARRequestData
 from .runtime.encoder import EncoderRequestData
@@ -34,7 +29,6 @@ __all__ = [
     # Encoder
     "EncoderRequestData",
     "create_encoder_engine",
-    "create_single_pass_engine",
     # AR (Simple)
     "ARRequestData",
     "create_ar_engine",
